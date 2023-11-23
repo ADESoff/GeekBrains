@@ -1,114 +1,87 @@
-import datetime
-import re
-import subprocess
-import uuid
-
 import telebot
-from telebot import types
-
-from config import sdir
-from config import token
-from db import add_to_db_tasklist, read_data_in_task, init_db, change_tz, get_user_tz
-from parser import import_dt, import_text
-
-bot = telebot.TeleBot(token)
+from datetime import datetime, timedelta
 
 
-@bot.message_handler(commands=['start', 'help'])  # Функция отвечает на команды 'start', 'help'
-def start_message(message):
-    tz_string = datetime.datetime.now(datetime.timezone.utc).astimezone().tzname()
-    bot.send_message(message.chat.id,
-                     f"Здравствуйте, я бот-помощник администрирования Telegramm-чатов. \n"
-                     f"Можете написать мне что и когда вам напомнить. \n"
-                     f"Например \"Встретиться завтра утром с другом\" или \"Забрать заказ 13 октября\"\n"
-                     f"Список напоминаний можно посмотреть с помощью команды /tasklist.\n"
-                     f"Я работаю в часовом поясе:{tz_string} \n")
+def get_manager_chat_id(message):
+    """ Получение ID пользователя из ответа на сообщение """
+    # Возвращает ID пользователя
+    return message.reply_to_message.from_user.id
 
 
-@bot.message_handler(commands=['tasklist'])  # Функция отвечает на комнаду tasklist
-def start_message(message):
-    text = read_data_in_task(message.chat.id)
-    bot.send_message(message.chat.id, text, parse_mode='Markdown')
+# Создаем бота и указываем токен
+bot = telebot.TeleBot('6724379265:AAFuMMpi5E3Zppg1uUsLUS6TRoU4frtKd8o')
+
+# Задаем время ожидания ответа и адресата для уведомления руководителя
+waiting_time = timedelta(hours=24)
+supervisor_chat_id = '1172183750'
+
+# Словарь для хранения последнего сообщения от клиента для каждого менеджера
+last_message = {}
 
 
-@bot.message_handler(commands=['timezone'])  # Функция отвечает на комнаду timezone
-def timezone_message(message):
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton(text='Изменить часовой пояс', callback_data='list_timezone'))
-    if get_user_tz(message.chat.id) == 'none':
-        bot.send_message(message.chat.id, 'Часовой пояс не установлен', reply_markup=keyboard)
-    else:
-        timezone = get_user_tz(message.chat.id)
-        bot.send_message(message.chat.id, timezone, reply_markup=keyboard)
+# Обработка команды /start
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, 'Привет! Я бот для анализа переписки с клиентами.')
 
 
-@bot.message_handler(content_types=['text'])  # Функция обрабатывает текстовые сообщения
-def in_text(message):
-    timezone = get_user_tz(message.chat.id)
-    if timezone == 'none':
-        bot.send_message(message.chat.id, "Не установлен часовой пояс.\n"
-                                          "Для изменения часового пояса введите команду /timezone")
-    else:
-        dt, dt_text = import_dt(message.text, get_user_tz(message.chat.id))
-        text = import_text(message.text)
-        if dt == 'null':
-            bot.send_message(message.chat.id, 'Нужно указать время!')
-        elif dt == 'old':
-            bot.send_message(message.chat.id, 'Это уже в прошлом!')
-        elif text == 'null':
-            bot.send_message(message.chat.id, 'Нужно указать о чем вам напомнить!')
-        else:
-            add_task(message.chat.id, text, dt, dt_text)
-            answer = 'Я напомню тебе ' + text + ' ' + dt_text
-            bot.send_message(message.chat.id, answer)
+# Обработка сообщений от клиентов
+@bot.message_handler(func=lambda message: message.chat.type == 'private')
+def handle_client_message(message):
+    # Получаем ID чата клиента и ответственного менеджера
+    client_chat_id = message.chat.id
+    manager_chat_id = get_manager_chat_id(message)
+
+    # Запоминаем последнее сообщение от клиента
+    last_message[manager_chat_id] = message
+
+    # Определяем время ожидания ответа
+    waiting_time_exceeded = datetime.now() - message.reply_to_message.date > waiting_time
+
+    if waiting_time_exceeded:
+        # Отправляем уведомление ответственному менеджеру
+        bot.send_message(manager_chat_id, 'Вы не ответили на сообщение клиента!')
+
+        # Отправляем уведомление руководителю
+        bot.send_message(supervisor_chat_id, 'Менеджер {} не ответил на сообщение клиента!'.format(manager_chat_id))
+
+    # Анализируем переписку на предмет негатива
+    if 'негативное слово' in message.text:
+        # Отправляем уведомление руководителю о конфликте
+        bot.send_message(supervisor_chat_id,
+                         'Обнаружен конфликт клиента {} с менеджером {}!'.format(client_chat_id, manager_chat_id))
 
 
-def add_task(id, text, date_time, dt_text):  # Функция создают задачу в AT и добавляет ее в бд
-    uid = uuid.uuid4()
-    cmd = f"""echo "{sdir}/send_message.py {id}  \'{text}\' {uid} '' " | at {date_time}"""
-    out = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    stdout = str(out.communicate())
-    number = re.search('job(.+?) at', stdout).group(1)
-    add_to_db_tasklist(id, number, dt_text, text, uid)
+# Обработка команды для назначения встречи
+@bot.message_handler(commands=['meeting'])
+def schedule_meeting(message):
+    # Получаем ID чата менеджера и назначаемую дату-время и тему звонка
+    manager_chat_id = message.from_user.id
+    meeting_data = message.text.split(' ', 1)[1]
+
+    # Проверяем, что есть последнее сообщение от клиента
+    if manager_chat_id in last_message:
+        # Получаем данные для напоминания
+        task_date_time, task_description = meeting_data.split(',', 1)
+
+        # Парсим дату и время задачи
+        task_date_time = datetime.strptime(task_date_time.strip(), '%Y-%m-%d %H:%M')
+
+        # Запланировать напоминания
+        reminders = [task_date_time - timedelta(hours=24), task_date_time - timedelta(hours=2)]
+        for reminder in reminders:
+            bot.send_message(manager_chat_id, 'Напоминание! Встреча "{}" через {}'.format(task_description.strip(),
+                                                                                          timedelta_to_string(
+                                                                                              task_date_time - reminder)))
 
 
-@bot.callback_query_handler(func=lambda call: True)  # Реакция на кнопки
-def callback(call):
-    if call.data == 'list_timezone':
-        list_timezone(call.message.chat.id)
-    if call.data.startswith('set_timezone:'):
-        timezone = call.data.split(':')[1]
-        change_tz(call.message.chat.id, timezone)
-        bot.answer_callback_query(call.id, show_alert=True, text='Часовой пояс установлен')
-    if call.data == ' через 15 минут':
-        later(call)
-    if call.data == ' через час':
-        later(call)
-    if call.data == ' завтра':
-        later(call)
+# Функция для преобразования timedelta в строку
+def timedelta_to_string(td):
+    days = td.days
+    hours = td.seconds // 3600
+    minutes = (td.seconds % 3600) // 60
+    seconds = td.seconds % 60
+    return '{} дней, {} часов, {} минут, {} секунд'.format(days, hours, minutes, seconds)
 
 
-def list_timezone(id):
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton(text='Europe/Moscow', callback_data='set_timezone:Europe/Moscow'))
-    keyboard.add(types.InlineKeyboardButton(text='Europe/Kaliningrad', callback_data='set_timezone:Europe/Kaliningrad'),
-                 types.InlineKeyboardButton(text='Europe/Samara', callback_data='set_timezone:Europe/Samara'))
-    keyboard.add(types.InlineKeyboardButton(text='Asia/Yekaterinburg', callback_data='set_timezone:Asia/Yekaterinburg'),
-                 types.InlineKeyboardButton(text='Asia/Omsk', callback_data='set_timezone:Asia/Omsk'))
-    keyboard.add(types.InlineKeyboardButton(text='Asia/Krasnoyarsk', callback_data='set_timezone:Asia/Krasnoyarsk'),
-                 types.InlineKeyboardButton(text='Asia/Irkutsk', callback_data='set_timezone:Asia/Irkutsk'))
-    keyboard.add(types.InlineKeyboardButton(text='Asia/Yakutsk', callback_data='set_timezone:Asia/Yakutsk'),
-                 types.InlineKeyboardButton(text='Asia/Vladivostok', callback_data='set_timezone:Asia/Vladivostok'))
-    keyboard.add(types.InlineKeyboardButton(text='Asia/Magadan', callback_data='set_timezone:Asia/Magadan'),
-                 types.InlineKeyboardButton(text='Asia/Kamchatka', callback_data='set_timezone:Asia/Kamchatka'))
-    bot.send_message(id, 'Выберите часовой пояс', reply_markup=keyboard)
-
-
-def later(call):
-    call.message.text = call.message.text + call.data
-    in_text(message=call.message)
-
-
-if __name__ == '__main__':  # Ожидать входящие сообщения
-    init_db()
-    bot.polling(0)
+bot.infinity_polling()
